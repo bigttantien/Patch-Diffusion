@@ -70,71 +70,33 @@ def forward_function(
     dist.print0('Loading dataset...')
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # subclass of training.dataset.Dataset
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
-    dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
+    dataset_iterator = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=None, batch_size=batch_gpu, **data_loader_kwargs)
 
     img_resolution, img_channels = dataset_obj.resolution, dataset_obj.num_channels
 
-    if train_on_latents:
-        # img_vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2", subfolder="vae").to(device)
-        img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
-        img_vae.eval()
-        set_requires_grad(img_vae, False)
-        latent_scale_factor = 0.18215
-        img_resolution, img_channels = dataset_obj.resolution // 8, 4
-    else:
-        img_vae = None
-
-    # # Construct network.
-    # dist.print0('Constructing network...')
-    # net_input_channels = img_channels + 2
-    # interface_kwargs = dict(img_resolution=img_resolution,
-    #                         img_channels=net_input_channels,
-    #                         out_channels=4 if train_on_latents else dataset_obj.num_channels,
-    #                         label_dim=dataset_obj.label_dim)
-    # net = dnnlib.util.construct_class_by_name(**network_kwargs, **interface_kwargs) # subclass of torch.nn.Module
-    # net.train().requires_grad_(True).to(device)
-    
     # Load network.
     dist.print0(f'Loading network from "{network_pkl}"...')
     with dnnlib.util.open_url(network_pkl, verbose=False) as f:
         net = pickle.load(f)['ema'].to(device)
 
-    if dist.get_rank() == 0:
-        with torch.no_grad():
-            images = torch.zeros([batch_gpu, img_channels, net.img_resolution, net.img_resolution], device=device)
-            sigma = torch.ones([batch_gpu], device=device)
-            x_pos = torch.zeros([batch_gpu, 2, net.img_resolution, net.img_resolution], device=device)
-            labels = torch.zeros([batch_gpu, net.label_dim], device=device)
-            misc.print_module_summary(net, [images, sigma, x_pos, labels], max_nesting=2)
+    # methods = [method for method in dir(net) if callable(getattr(net, method))]
 
-    # Setup optimizer.
-    dist.print0('Setting up optimizer...')
-    loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
-    optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
-    augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
-    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
-    ema = copy.deepcopy(net).eval().requires_grad_(False)
+    # # In ra tất cả các phương thức
+    # for method in methods:
+    #     print(method)
 
-    # Resume training from previous snapshot.
-    if resume_pkl is not None:
-        dist.print0(f'Loading network weights from "{resume_pkl}"...')
-        if dist.get_rank() != 0:
-            torch.distributed.barrier() # rank 0 goes first
-        with dnnlib.util.open_url(resume_pkl, verbose=(dist.get_rank() == 0)) as f:
-            data = pickle.load(f)
-        if dist.get_rank() == 0:
-            torch.distributed.barrier() # other ranks follow
-        misc.copy_params_and_buffers(src_module=data['ema'], dst_module=net, require_all=False)
-        misc.copy_params_and_buffers(src_module=data['ema'], dst_module=ema, require_all=False)
-        del data # conserve memory
-    if resume_state_dump:
-        dist.print0(f'Loading training state from "{resume_state_dump}"...')
-        data = torch.load(resume_state_dump, map_location=torch.device('cpu'))
-        misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
-        optimizer.load_state_dict(data['optimizer_state'])
-        del data # conserve memory
+    # assert 1== 9
 
-    print(len(dataset_iterator))
+    for batch in dataset_iterator:
+        images, labels = batch
+        images = images.to(device).to(torch.float32) / 127.5 - 1
+        labels = labels.to(device)
+
+        out = net(images)
+        print(out.shape)
+
+        break
+
     # Forward
     # dist.print0(f'Start forward for {total_kimg} kimg...')
     # dist.print0()
