@@ -99,9 +99,6 @@ def forward_function(
     with dnnlib.util.open_url(network_pkl, verbose=False) as f:
         net = pickle.load(f)['ema'].to(device)
 
-    print(net)
-    assert 1==2
-
     if dist.get_rank() == 0:
         with torch.no_grad():
             images = torch.zeros([batch_gpu, img_channels, net.img_resolution, net.img_resolution], device=device)
@@ -137,139 +134,44 @@ def forward_function(
         optimizer.load_state_dict(data['optimizer_state'])
         del data # conserve memory
 
-    # Train.
-    dist.print0(f'Training for {total_kimg} kimg...')
-    dist.print0()
-    cur_nimg = resume_kimg * 1000
-    cur_tick = 0
-    tick_start_nimg = cur_nimg
-    tick_start_time = time.time()
-    maintenance_time = tick_start_time - start_time
-    dist.update_progress(cur_nimg // 1000, total_kimg)
-    stats_jsonl = None
-    batch_mul_dict = {512: 1, 256: 2, 128: 4, 64: 16, 32: 32, 16: 64}
-    if train_on_latents:
-        p_list = np.array([(1 - real_p), real_p])
-        patch_list = np.array([img_resolution // 2, img_resolution])
-        batch_mul_avg = np.sum(p_list * np.array([2, 1]))
-    else:
-        p_list = np.array([(1-real_p)*2/5, (1-real_p)*3/5, real_p])
-        patch_list = np.array([img_resolution//4, img_resolution//2, img_resolution])
-        batch_mul_avg = np.sum(np.array(p_list) * np.array([4, 2, 1]))  # 2
-    while True:
+    print(len(dataset_iterator))
+    # Forward
+    # dist.print0(f'Start forward for {total_kimg} kimg...')
+    # dist.print0()
+    # cur_nimg = resume_kimg * 1000
+    # cur_tick = 0
+    # tick_start_nimg = cur_nimg
+    # tick_start_time = time.time()
+    # maintenance_time = tick_start_time - start_time
+    # dist.update_progress(cur_nimg // 1000, total_kimg)
+    # stats_jsonl = None
+    # batch_mul_dict = {512: 1, 256: 2, 128: 4, 64: 16, 32: 32, 16: 64}
+    # if train_on_latents:
+    #     p_list = np.array([(1 - real_p), real_p])
+    #     patch_list = np.array([img_resolution // 2, img_resolution])
+    #     batch_mul_avg = np.sum(p_list * np.array([2, 1]))
+    # else:
+    #     p_list = np.array([(1-real_p)*2/5, (1-real_p)*3/5, real_p])
+    #     patch_list = np.array([img_resolution//4, img_resolution//2, img_resolution])
+    #     batch_mul_avg = np.sum(np.array(p_list) * np.array([4, 2, 1]))  # 2
 
-        # Accumulate gradients.
-        optimizer.zero_grad(set_to_none=True)
-        for round_idx in range(num_accumulation_rounds):
-            with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                if progressive:
-                    p_cumsum = p_list.cumsum()
-                    p_cumsum[-1] = 10.
-                    prog_mask = (cur_nimg // 1000 / total_kimg) <= p_cumsum
-                    patch_size = int(patch_list[prog_mask][0])
-                    batch_mul_avg = batch_mul_dict[patch_size] // batch_mul_dict[img_resolution]
-                else:
-                    patch_size = int(np.random.choice(patch_list, p=p_list))
+    # batch_mul = batch_mul_dict[patch_size] // batch_mul_dict[img_resolution]
+    # images, labels = [], []
+    # for _ in range(batch_mul):
+    #     images_, labels_ = next(dataset_iterator)
+    #     images.append(images_), labels.append(labels_)
+    # images, labels = torch.cat(images, dim=0), torch.cat(labels, dim=0)
+    # del images_, labels_
+    # images = images.to(device).to(torch.float32) / 127.5 - 1
 
-                batch_mul = batch_mul_dict[patch_size] // batch_mul_dict[img_resolution]
-                images, labels = [], []
-                for _ in range(batch_mul):
-                    images_, labels_ = next(dataset_iterator)
-                    images.append(images_), labels.append(labels_)
-                images, labels = torch.cat(images, dim=0), torch.cat(labels, dim=0)
-                del images_, labels_
-                images = images.to(device).to(torch.float32) / 127.5 - 1
+    # if train_on_latents:
+    #     with torch.no_grad():
+    #         images = img_vae.encode(images)['latent_dist'].sample()
+    #         images = latent_scale_factor * images
 
-                if train_on_latents:
-                    with torch.no_grad():
-                        images = img_vae.encode(images)['latent_dist'].sample()
-                        images = latent_scale_factor * images
-
-                labels = labels.to(device)
-                loss = loss_fn(net=ddp, images=images, patch_size=patch_size, resolution=img_resolution,
-                               labels=labels, augment_pipe=augment_pipe)
-                training_stats.report('Loss/loss', loss)
-                loss.sum().mul(loss_scaling / batch_gpu_total / batch_mul).backward()
-                # loss.mean().mul(loss_scaling / batch_mul).backward()
-
-        # Update weights.
-        for g in optimizer.param_groups:
-            g['lr'] = optimizer_kwargs['lr'] * min(cur_nimg / max(lr_rampup_kimg * 1000, 1e-8), 1)
-        for param in net.parameters():
-            if param.grad is not None:
-                torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
-        optimizer.step()
-
-        # Update EMA.
-        ema_halflife_nimg = ema_halflife_kimg * 1000
-        if ema_rampup_ratio is not None:
-            ema_halflife_nimg = min(ema_halflife_nimg, cur_nimg * ema_rampup_ratio)
-        ema_beta = 0.5 ** (batch_size * batch_mul_avg / max(ema_halflife_nimg, 1e-8))
-        for p_ema, p_net in zip(ema.parameters(), net.parameters()):
-            p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
-
-        # Perform maintenance tasks once per tick.
-        cur_nimg += int(batch_size * batch_mul_avg)
-        done = (cur_nimg >= total_kimg * 1000)
-        if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
-            continue
-
-        # Print status line, accumulating the same information in training_stats.
-        tick_end_time = time.time()
-        fields = []
-        fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
-        fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<9.1f}"]
-        fields += [f"loss {loss.mean().item():<9.3f}"]
-        fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
-        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
-        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
-        fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
-        fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
-        fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
-        fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
-        torch.cuda.reset_peak_memory_stats()
-        dist.print0(' '.join(fields))
-
-        # Check for abort.
-        if (not done) and dist.should_stop():
-            done = True
-            dist.print0()
-            dist.print0('Aborting...')
-
-        # Save network snapshot.
-        if (snapshot_ticks is not None) and (done or cur_tick % snapshot_ticks == 0):
-            data = dict(ema=ema, loss_fn=loss_fn, augment_pipe=augment_pipe, dataset_kwargs=dict(dataset_kwargs))
-            for key, value in data.items():
-                if isinstance(value, torch.nn.Module):
-                    value = copy.deepcopy(value).eval().requires_grad_(False)
-                    misc.check_ddp_consistency(value)
-                    data[key] = value.cpu()
-                del value # conserve memory
-            if dist.get_rank() == 0:
-                with open(os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl'), 'wb') as f:
-                    pickle.dump(data, f)
-            del data # conserve memory
-
-        # Save full dump of the training state.
-        if (state_dump_ticks is not None) and (done or cur_tick % state_dump_ticks == 0) and cur_tick != 0 and dist.get_rank() == 0:
-            torch.save(dict(net=net, optimizer_state=optimizer.state_dict()), os.path.join(run_dir, f'training-state-{cur_nimg//1000:06d}.pt'))
-
-        # Update logs.
-        training_stats.default_collector.update()
-        if dist.get_rank() == 0:
-            if stats_jsonl is None:
-                stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
-            stats_jsonl.write(json.dumps(dict(training_stats.default_collector.as_dict(), timestamp=time.time())) + '\n')
-            stats_jsonl.flush()
-        dist.update_progress(cur_nimg // 1000, total_kimg)
-
-        # Update state.
-        cur_tick += 1
-        tick_start_nimg = cur_nimg
-        tick_start_time = time.time()
-        maintenance_time = tick_start_time - tick_end_time
-        if done:
-            break
+    # labels = labels.to(device)
+    # loss = loss_fn(net=ddp, images=images, patch_size=patch_size, resolution=img_resolution,
+    #                 labels=labels, augment_pipe=augment_pipe)
 
     # Done.
     dist.print0()
