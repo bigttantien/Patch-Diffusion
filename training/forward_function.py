@@ -34,8 +34,7 @@ class forward_class:
         weight = 1 / sigma ** 2
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
-        # loss = weight * ((D_yn - y) ** 2)
+        D_yn = net(x=y + n, sigma=sigma, class_labels=labels, augment_labels=augment_labels)
         return D_yn
 
     def sigma(self, t):
@@ -94,6 +93,7 @@ def forward_function(
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # subclass of training.dataset.Dataset
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dataset_iterator = torch.utils.data.DataLoader(dataset=dataset_obj, sampler=None, batch_size=batch_gpu, **data_loader_kwargs)
+    augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
 
     img_resolution, img_channels = dataset_obj.resolution, dataset_obj.num_channels
 
@@ -101,14 +101,16 @@ def forward_function(
     dist.print0(f'Loading network from "{network_pkl}"...')
     with dnnlib.util.open_url(network_pkl, verbose=False) as f:
         net = pickle.load(f)['ema'].to(device)
+    net.train().requires_grad_(True).to(device)
+
+    # Setup optimizer.
+    dist.print0('Setting up optimizer...')
+    loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
+    optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
+    ema = copy.deepcopy(net).eval().requires_grad_(False)
 
-    # # In ra tất cả các phương thức
-    # methods = [method for method in dir(net) if callable(getattr(net, method))]
-    # for method in methods:
-    #     print(method)
-    # assert 1== 9
 
     forward_fn = forward_class()
 
@@ -117,8 +119,7 @@ def forward_function(
         images = images.to(device).to(torch.float32) / 127.5 - 1
         labels = labels.to(device)
 
-        out = forward_fn(net=ddp, images=images, resolution=img_resolution,
-                               labels=labels, augment_pipe=augment_pipe)
+        out = forward_fn(net=ema, images=images, labels=None, augment_pipe=augment_pipe)
         print(out.shape)
 
         break
