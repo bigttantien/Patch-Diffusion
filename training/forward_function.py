@@ -15,9 +15,32 @@ from torch_utils import misc
 
 from diffusers import AutoencoderKL
 
+from torch_utils import persistence
+
 def set_requires_grad(model, value):
     for param in model.parameters():
         param.requires_grad = value
+
+@persistence.persistent_class
+class forward_class:
+    def __init__(self, beta_d=19.9, beta_min=0.1, epsilon_t=1e-5):
+        self.beta_d = beta_d
+        self.beta_min = beta_min
+        self.epsilon_t = epsilon_t
+    
+    def __call__(self, net, images, labels, augment_pipe=None):
+        rnd_uniform = torch.rand([images.shape[0], 1, 1, 1], device=images.device)
+        sigma = self.sigma(1 + rnd_uniform * (self.epsilon_t - 1))
+        weight = 1 / sigma ** 2
+        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        n = torch.randn_like(y) * sigma
+        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
+        # loss = weight * ((D_yn - y) ** 2)
+        return D_yn
+
+    def sigma(self, t):
+        t = torch.as_tensor(t)
+        return ((0.5 * self.beta_d * (t ** 2) + self.beta_min * t).exp() - 1).sqrt()
 
 #----------------------------------------------------------------------------
 
@@ -78,62 +101,28 @@ def forward_function(
     dist.print0(f'Loading network from "{network_pkl}"...')
     with dnnlib.util.open_url(network_pkl, verbose=False) as f:
         net = pickle.load(f)['ema'].to(device)
-
-    # methods = [method for method in dir(net) if callable(getattr(net, method))]
+    augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
+    ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
 
     # # In ra tất cả các phương thức
+    # methods = [method for method in dir(net) if callable(getattr(net, method))]
     # for method in methods:
     #     print(method)
-
     # assert 1== 9
+
+    forward_fn = forward_class()
 
     for batch in dataset_iterator:
         images, labels = batch
         images = images.to(device).to(torch.float32) / 127.5 - 1
         labels = labels.to(device)
 
-        out = net(images)
+        out = forward_fn(net=ddp, images=images, resolution=img_resolution,
+                               labels=labels, augment_pipe=augment_pipe)
         print(out.shape)
 
         break
 
-    # Forward
-    # dist.print0(f'Start forward for {total_kimg} kimg...')
-    # dist.print0()
-    # cur_nimg = resume_kimg * 1000
-    # cur_tick = 0
-    # tick_start_nimg = cur_nimg
-    # tick_start_time = time.time()
-    # maintenance_time = tick_start_time - start_time
-    # dist.update_progress(cur_nimg // 1000, total_kimg)
-    # stats_jsonl = None
-    # batch_mul_dict = {512: 1, 256: 2, 128: 4, 64: 16, 32: 32, 16: 64}
-    # if train_on_latents:
-    #     p_list = np.array([(1 - real_p), real_p])
-    #     patch_list = np.array([img_resolution // 2, img_resolution])
-    #     batch_mul_avg = np.sum(p_list * np.array([2, 1]))
-    # else:
-    #     p_list = np.array([(1-real_p)*2/5, (1-real_p)*3/5, real_p])
-    #     patch_list = np.array([img_resolution//4, img_resolution//2, img_resolution])
-    #     batch_mul_avg = np.sum(np.array(p_list) * np.array([4, 2, 1]))  # 2
-
-    # batch_mul = batch_mul_dict[patch_size] // batch_mul_dict[img_resolution]
-    # images, labels = [], []
-    # for _ in range(batch_mul):
-    #     images_, labels_ = next(dataset_iterator)
-    #     images.append(images_), labels.append(labels_)
-    # images, labels = torch.cat(images, dim=0), torch.cat(labels, dim=0)
-    # del images_, labels_
-    # images = images.to(device).to(torch.float32) / 127.5 - 1
-
-    # if train_on_latents:
-    #     with torch.no_grad():
-    #         images = img_vae.encode(images)['latent_dist'].sample()
-    #         images = latent_scale_factor * images
-
-    # labels = labels.to(device)
-    # loss = loss_fn(net=ddp, images=images, patch_size=patch_size, resolution=img_resolution,
-    #                 labels=labels, augment_pipe=augment_pipe)
 
     # Done.
     dist.print0()
