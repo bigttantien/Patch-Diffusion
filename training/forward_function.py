@@ -110,14 +110,36 @@ def forward_function(
 
 
     forward_fn = forward_class()
+    from PIL import Image
 
     for batch in dataset_iterator:
         images, labels = batch
         images = images.to(device).to(torch.float32) / 127.5 - 1
         labels = labels.to(device)
 
-        out = forward_fn(net=ema, images=images, labels=None, augment_pipe=augment_pipe)
-        print(out.shape)
+        x_start = 0
+        y_start = 0
+        image_size = img_resolution
+        resolution = img_resolution
+        x_pos = torch.arange(x_start, x_start+image_size).view(1, -1).repeat(image_size, 1)
+        y_pos = torch.arange(y_start, y_start+image_size).view(-1, 1).repeat(1, image_size)
+        x_pos = (x_pos / (resolution - 1) - 0.5) * 2.
+        y_pos = (y_pos / (resolution - 1) - 0.5) * 2.
+        latents_pos = torch.stack([x_pos, y_pos], dim=0).to(device)
+        latents_pos = latents_pos.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+
+        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        sigma = (rnd_normal * 1.2 + -1.2).exp()
+        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        n = torch.randn_like(y) * sigma
+        print(sigma.shape)
+
+        out = ema(y + n, sigma, latents_pos, None)
+        print("Predict Oke")
+        
+        tensor = (out)[0]
+        output_img = Image.fromarray(((tensor.cpu().numpy() + 1)*127.5).astype('uint8').transpose((1, 2, 0)))
+        output_img.save("output_image.png")
 
         break
 
