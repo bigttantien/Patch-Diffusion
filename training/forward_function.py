@@ -12,6 +12,9 @@ import dnnlib
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
+from tqdm import tqdm
+from PIL import Image
+
 
 from diffusers import AutoencoderKL
 
@@ -20,23 +23,6 @@ from torch_utils import persistence
 def set_requires_grad(model, value):
     for param in model.parameters():
         param.requires_grad = value
-
-@persistence.persistent_class
-class forward_class:
-    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
-        self.P_mean = P_mean
-        self.P_std = P_std
-        self.sigma_data = sigma_data
-
-    def __call__(self, net, images, labels=None, augment_pipe=None):
-        rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
-        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
-        n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
-        # loss = weight * ((D_yn - y) ** 2)
-        return D_yn
 
 #----------------------------------------------------------------------------
 
@@ -110,12 +96,15 @@ def forward_function(
 
 
     forward_fn = forward_class()
-    from PIL import Image
 
-    for batch in dataset_iterator:
+    os.mkdir(os.path.join(run_dir, "output_forward"))
+
+    batch_name = 1
+    for batch in tqdm(dataset_iterator):
         images, labels = batch
         images = images.to(device).to(torch.float32) / 127.5 - 1
         labels = labels.to(device)
+        # print("Len batch:", len(images))
 
         x_start = 0
         y_start = 0
@@ -126,22 +115,30 @@ def forward_function(
         x_pos = (x_pos / (resolution - 1) - 0.5) * 2.
         y_pos = (y_pos / (resolution - 1) - 0.5) * 2.
         latents_pos = torch.stack([x_pos, y_pos], dim=0).to(device)
-        latents_pos = latents_pos.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        latents_pos = latents_pos.unsqueeze(0).repeat(len(images), 1, 1, 1)
+        # print("latents_pos: ",latents_pos.shape)
 
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        sigma = (rnd_normal * 1.2 + -1.2).exp()
-        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
+        sigma = (rnd_normal * 1.2 - 1.2).exp()
+        y, augment_labels = images, None
         n = torch.randn_like(y) * sigma
-        print(sigma.shape)
+        # print("sigma: ", sigma.shape)
+        # print("y+n", (y+n).shape)
+
+        test = (y+n)[0]
+        output_img = Image.fromarray(((test.cpu().numpy() + 1)*127.5).astype('uint8').transpose((1, 2, 0)))
+        output_img.save("test.png")
+        assert 1==2
 
         out = ema(y + n, sigma, latents_pos, None)
-        print("Predict Oke")
         
-        tensor = (out)[0]
-        output_img = Image.fromarray(((tensor.cpu().numpy() + 1)*127.5).astype('uint8').transpose((1, 2, 0)))
-        output_img.save("output_image.png")
+        for i in range(len(images)):
+            out_i = out[i]
+            output_img = Image.fromarray(((out_i.cpu().numpy() + 1)*127.5).astype('uint8').transpose((1, 2, 0)))
+            output_img_dir = os.path.join(run_dir, "output_forward", f"output_image_{i+batch_name}.png")
+            output_img.save(output_img_dir)
 
-        break
+        batch_name += 64
 
 
     # Done.
